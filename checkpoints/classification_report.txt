@@ -1,0 +1,54 @@
+Test accuracy: 99.61%
+
+                           precision    recall  f1-score   support
+
+         character_10_yna     1.0000    1.0000    1.0000       300
+    character_11_taamatar     1.0000    0.9900    0.9950       300
+        character_12_thaa     0.9967    0.9967    0.9967       300
+         character_13_daa     0.9934    0.9967    0.9950       300
+        character_14_dhaa     0.9933    0.9833    0.9883       300
+        character_15_adna     1.0000    1.0000    1.0000       300
+      character_16_tabala     0.9868    0.9967    0.9917       300
+         character_17_tha     0.9900    0.9933    0.9917       300
+          character_18_da     0.9803    0.9933    0.9868       300
+         character_19_dha     1.0000    0.9833    0.9916       300
+           character_1_ka     1.0000    1.0000    1.0000       300
+          character_20_na     0.9967    0.9967    0.9967       300
+          character_21_pa     0.9967    0.9967    0.9967       300
+         character_22_pha     1.0000    1.0000    1.0000       300
+          character_23_ba     0.9800    0.9800    0.9800       300
+         character_24_bha     1.0000    1.0000    1.0000       300
+          character_25_ma     1.0000    1.0000    1.0000       300
+         character_26_yaw     0.9804    1.0000    0.9901       300
+          character_27_ra     0.9967    0.9933    0.9950       300
+          character_28_la     0.9967    1.0000    0.9983       300
+         character_29_waw     0.9738    0.9900    0.9818       300
+          character_2_kha     1.0000    1.0000    1.0000       300
+     character_30_motosaw     1.0000    0.9933    0.9967       300
+character_31_petchiryakha     1.0000    0.9967    0.9983       300
+   character_32_patalosaw     0.9967    1.0000    0.9983       300
+          character_33_ha     1.0000    1.0000    1.0000       300
+       character_34_chhya     1.0000    0.9967    0.9983       300
+         character_35_tra     1.0000    0.9867    0.9933       300
+         character_36_gya     1.0000    0.9933    0.9967       300
+           character_3_ga     1.0000    1.0000    1.0000       300
+          character_4_gha     0.9836    1.0000    0.9917       300
+          character_5_kna     1.0000    0.9967    0.9983       300
+          character_6_cha     1.0000    0.9900    0.9950       300
+         character_7_chha     1.0000    0.9900    0.9950       300
+           character_8_ja     1.0000    1.0000    1.0000       300
+          character_9_jha     1.0000    1.0000    1.0000       300
+                  digit_0     1.0000    1.0000    1.0000       300
+                  digit_1     1.0000    0.9967    0.9983       300
+                  digit_2     0.9967    0.9967    0.9967       300
+                  digit_3     0.9967    1.0000    0.9983       300
+                  digit_4     0.9967    1.0000    0.9983       300
+                  digit_5     1.0000    0.9967    0.9983       300
+                  digit_6     0.9967    1.0000    0.9983       300
+                  digit_7     1.0000    1.0000    1.0000       300
+                  digit_8     0.9967    1.0000    0.9983       300
+                  digit_9     0.9967    0.9967    0.9967       300
+
+                 accuracy                         0.9961     13800
+                macro avg     0.9961    0.9961    0.9961     13800
+             weighted avg     0.9961    0.9961    0.9961     13800

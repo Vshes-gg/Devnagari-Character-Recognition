@@ -1,0 +1,9 @@
+# Devanagari OCR Engine — Python dependencies
+# Versions match the environment the project was developed and verified on.
+
+torch==2.14.1
+torchvision==0.29.1
+numpy==2.5.3
+opencv-python==5.0.0.93
+pillow==12.3.0
+scikit-learn==1.9.1

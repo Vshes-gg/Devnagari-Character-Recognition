@@ -1,0 +1,838 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════════════════╗
+║        PRODUCTION-GRADE PYTORCH DEVANAGARI HANDWRITTEN OCR ENGINE                       ║
+║        Supports: Custom PyTorch CNN Model + Segmenter + Training + Pipeline Integrator   ║
+║                                                                                          ║
+║  Strategy Overview:                                                                      ║
+║  ──────────────────────────────────────────────────────────────────────────────────────  ║
+║  ① Image Preprocessing: Shadow removal, deskew, CLAHE, bilateral denoising, line erase   ║
+║  ② Line & Character Segmentation: Shirorekha removal + horizontal projection clustering  ║
+║  ③ Deep Learning Engine: Custom 32x32 Devanagari CNN (DHCD standard 46 classes)           ║
+║  ④ High-Level Recognition: CRNN (CNN + BiLSTM + CTC) module for continuous sentences     ║
+║  ⑤ Full Training Pipeline: PyTorch Trainer with augmentations, AdamW, & learning rate   ║
+║  ⑥ Document Reconstruction: Spatial line grouping & confidence-coded visual exporter     ║
+╚══════════════════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import sys
+import math
+import argparse
+import numpy as np
+import cv2
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+import torchvision.transforms as T
+from sklearn.model_selection import train_test_split
+
+
+# ============================================================================
+#  SECTION 0: COMPUTE DEVICE SELECTION
+# ============================================================================
+
+def get_device():
+    """
+    Pick the fastest compute backend available, in priority order:
+      1. CUDA — NVIDIA GPU.
+      2. MPS  — Metal Performance Shaders, Apple Silicon's GPU backend
+                (typically 5-20x faster than CPU for CNN training).
+      3. CPU  — always-available fallback.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def describe_device(device):
+    """Human-readable device name for progress printing."""
+    if device.type == "cuda":
+        return f"CUDA GPU ({torch.cuda.get_device_name(0)})"
+    if device.type == "mps":
+        return "Apple Silicon GPU (MPS)"
+    return "CPU"
+
+
+# ============================================================================
+#  SECTION 1: DEVANAGARI CHARACTER MAPPING & CONSTANTS
+# ============================================================================
+
+# DHCD (Devanagari Handwritten Character Dataset) 46 Class Mapping
+# 36 Consonants (क to ज्ञ) + 10 Digits (० to ९)
+DHCD_LABEL_MAP = {
+    0: ("character_1_ka", "क"), 1: ("character_2_kha", "ख"), 2: ("character_3_ga", "ग"),
+    3: ("character_4_gha", "घ"), 4: ("character_5_kna", "ङ"), 5: ("character_6_cha", "च"),
+    6: ("character_7_chha", "छ"), 7: ("character_8_ja", "ज"), 8: ("character_9_jha", "झ"),
+    9: ("character_10_yna", "ञ"), 10: ("character_11_taamatar", "ट"), 11: ("character_12_thaa", "ठ"),
+    12: ("character_13_daa", "ड"), 13: ("character_14_dhaa", "ढ"), 14: ("character_15_adna", "ण"),
+    15: ("character_16_tabala", "त"), 16: ("character_17_tha", "थ"), 17: ("character_18_da", "द"),
+    18: ("character_19_dha", "ध"), 19: ("character_20_na", "न"), 20: ("character_21_pa", "प"),
+    21: ("character_22_pha", "फ"), 22: ("character_23_ba", "ब"), 23: ("character_24_bha", "भ"),
+    24: ("character_25_ma", "म"), 25: ("character_26_yaw", "य"), 26: ("character_27_ra", "र"),
+    27: ("character_28_la", "ल"), 28: ("character_29_waw", "व"), 29: ("character_30_motosaw", "श"),
+    30: ("character_31_petchiryakha", "ष"), 31: ("character_32_patalosaw", "स"), 32: ("character_33_ha", "ह"),
+    33: ("character_34_chhya", "क्ष"), 34: ("character_35_tra", "त्र"), 35: ("character_36_gya", "ज्ञ"),
+    36: ("digit_0", "०"), 37: ("digit_1", "१"), 38: ("digit_2", "२"), 39: ("digit_3", "३"),
+    40: ("digit_4", "४"), 41: ("digit_5", "५"), 42: ("digit_6", "६"), 43: ("digit_7", "७"),
+    44: ("digit_8", "८"), 45: ("digit_9", "९")
+}
+
+# Reverse mapping from folder/class name to Devanagari character
+FOLDER_TO_UNICODE = {v[0]: v[1] for k, v in DHCD_LABEL_MAP.items()}
+INDEX_TO_UNICODE = {k: v[1] for k, v in DHCD_LABEL_MAP.items()}
+
+
+# ============================================================================
+#  SECTION 2: PYTORCH ARCHITECTURES
+# ============================================================================
+
+class DevanagariCNN(nn.Module):
+    """
+    Deep Convolutional Neural Network custom-designed for 32x32 single-channel
+    grayscale Devanagari character recognition.
+    
+    Architecture Highlights:
+      - 3 Residual-style Convolutional Blocks with BatchNorm and LeakyReLU
+      - Spatial Dropout to prevent co-adaptation on handwriting strokes
+      - Global Average Pooling + Dense layers for high-precision classification
+    """
+    def __init__(self, num_classes=46):
+        super(DevanagariCNN, self).__init__()
+        
+        # Conv Block 1: Input (1 x 32 x 32) -> Output (32 x 16 x 16)
+        self.block1 = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+        
+        # Conv Block 2: Input (32 x 16 x 16) -> Output (64 x 8 x 8)
+        self.block2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+        
+        # Conv Block 3: Input (64 x 8 x 8) -> Output (128 x 4 x 4)
+        self.block3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+        
+        # Fully Connected Classifier
+        self.dropout = nn.Dropout(p=0.4)
+        self.fc1 = nn.Linear(128 * 4 * 4, 256)
+        self.bn_fc = nn.BatchNorm1d(256)
+        self.fc2 = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        x = self.dropout(x)
+        x = F.leaky_relu(self.bn_fc(self.fc1(x)), 0.1)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+
+class DevanagariCRNN(nn.Module):
+    """
+    Convolutional Recurrent Neural Network (CRNN) with BiLSTM for continuous line/word
+    sequence recognition without explicit character segmentation.
+    """
+    def __init__(self, num_classes=47, hidden_size=256):
+        super(DevanagariCRNN, self).__init__()
+        
+        # CNN Feature Extractor for variable width input images (1 x 32 x W)
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            nn.MaxPool2d(2, 2),  # (64, 16, W/2)
+            
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            nn.MaxPool2d(2, 2),  # (128, 8, W/4)
+            
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            nn.MaxPool2d((2, 1), (2, 1)),  # (256, 4, W/4)
+            
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+            nn.MaxPool2d((4, 1), (4, 1))   # (512, 1, W/4)
+        )
+        
+        # Bidirectional LSTM Sequence Encoder
+        self.rnn = nn.Sequential(
+            nn.LSTM(512, hidden_size, bidirectional=True, batch_first=True),
+            nn.LSTM(hidden_size * 2, hidden_size, bidirectional=True, batch_first=True)
+        )
+        
+        # Linear projection to class probabilities (+1 for CTC Blank Token)
+        self.fc = nn.Linear(hidden_size * 2, num_classes)
+
+    def forward(self, x):
+        # Input x shape: (Batch, 1, Height=32, Width=W)
+        conv = self.cnn(x)
+        b, c, h, w = conv.size()
+        assert h == 1, "Height of conv feature map must be collapsed to 1"
+        
+        conv = conv.squeeze(2)  # (Batch, Channels=512, Width=W')
+        conv = conv.permute(0, 2, 1)  # (Batch, TimeSteps=W', FeatureDims=512)
+        
+        recurrent, _ = self.rnn(conv)
+        logits = self.fc(recurrent)  # (Batch, TimeSteps, NumClasses)
+        return logits.log_softmax(2)
+
+
+# ============================================================================
+#  SECTION 3: IMAGE PREPROCESSING & GEOMETRY UTILITIES
+# ============================================================================
+
+def bbox_to_xyxy(bbox):
+    """Convert standard polygon/list points to [x1, y1, x2, y2] integers."""
+    xs = [pt[0] for pt in bbox]
+    ys = [pt[1] for pt in bbox]
+    return [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
+
+
+def compute_iou(box1, box2):
+    """Calculate Intersection-over-Union (IoU) between two bounding boxes."""
+    ix1, iy1 = max(box1[0], box2[0]), max(box1[1], box2[1])
+    ix2, iy2 = min(box1[2], box2[2]), min(box1[3], box2[3])
+    inter_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    
+    if inter_area == 0:
+        return 0.0
+        
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = area1 + area2 - inter_area
+    return inter_area / union_area if union_area > 0 else 0.0
+
+
+def remove_shadows(gray):
+    """Lift shadow gradients using background estimation via large-kernel dilation."""
+    kernel = np.ones((7, 7), np.uint8)
+    dilated = cv2.dilate(gray, kernel)
+    bg_estimate = cv2.GaussianBlur(dilated, (21, 21), 0)
+    normalized = cv2.divide(gray.astype(np.float32), bg_estimate.astype(np.float32), scale=255.0)
+    return np.clip(normalized, 0, 255).astype(np.uint8)
+
+
+def deskew(gray):
+    """Detect tilt using minimum bounding box on text pixels and rotate horizontally."""
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    coords = np.column_stack(np.where(binary > 0))
+    if len(coords) < 100:
+        return gray
+        
+    rect = cv2.minAreaRect(coords)
+    angle = rect[-1]
+    if angle < -45.0:
+        angle = 90.0 + angle
+    if abs(angle) < 0.5:
+        return gray
+        
+    h, w = gray.shape
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=255)
+
+
+def apply_clahe(gray):
+    """Contrast Limited Adaptive Histogram Equalization for localized contrast."""
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
+def bilateral_denoise(gray):
+    """Edge-preserving smoothing to eliminate paper texture and camera noise."""
+    return cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+
+
+def remove_ruled_lines(gray):
+    """Isolate and erase notebook horizontal ruled lines via morphological opening."""
+    h, w = gray.shape
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel_width = max(30, w // 4)
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
+    line_mask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    line_mask = cv2.dilate(line_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)), iterations=1)
+    
+    result = gray.copy()
+    result[line_mask == 255] = 255
+    return cv2.inpaint(result, line_mask, inpaintRadius=2, flags=cv2.INPAINT_TELEA)
+
+
+def full_preprocessing_pipeline(image_bgr):
+    """Execute complete enhancement chain on input image."""
+    h, w = image_bgr.shape[:2]
+    if h < 1200:
+        scale = 1200 / h
+        image_bgr = cv2.resize(image_bgr, (int(w * scale), 1200), interpolation=cv2.INTER_CUBIC)
+        
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = remove_shadows(gray)
+    gray = deskew(gray)
+    gray = apply_clahe(gray)
+    gray = bilateral_denoise(gray)
+    gray = remove_ruled_lines(gray)
+    return gray
+
+
+# ============================================================================
+#  SECTION 4: SEGMENTATION ENGINE (CHARACTER & SHIROREKHA CUTTING)
+# ============================================================================
+
+def remove_shirorekha(line_binary):
+    """
+    Detect and erase the horizontal top bar (Shirorekha) connecting Devanagari 
+    characters to allow contour separation into individual letters.
+    """
+    h, w = line_binary.shape
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, int(w * 0.04)), 1))
+    shirorekha_mask = cv2.morphologyEx(line_binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    
+    # Subtract top bar from original binary line
+    char_binary = cv2.subtract(line_binary, shirorekha_mask)
+    return char_binary, shirorekha_mask
+
+
+def segment_characters_from_line(line_gray):
+    """
+    Splits a single text line into individual character crops.
+
+    Connected components on the shirorekha-stripped binary fragment
+    handwriting badly (subtracting the top bar disconnects upper loops and
+    matras from the body, and those fragments - classified alone - destroy
+    accuracy). Instead, characters are located by VERTICAL PROJECTION on the
+    stripped binary: contiguous inked column runs are candidate characters
+    (gaps of <=2 px are bridged). Each character's final box is the union
+    bounding box of ALL ink inside its column range measured on the ORIGINAL
+    binary - so the shirorekha and upper-zone matras stay inside the crop,
+    matching how DHCD training glyphs are framed.
+    """
+    # Binarize line: Text = White, Background = Black
+    _, binary = cv2.threshold(line_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Strip Shirorekha (used only to find column boundaries)
+    char_binary, _ = remove_shirorekha(binary)
+
+    # Morphological clean up of tiny gaps
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    char_binary = cv2.morphologyEx(char_binary, cv2.MORPH_CLOSE, kernel)
+
+    line_h, line_w = line_gray.shape
+    col_ink = (char_binary > 0).sum(axis=0)
+
+    # Vertical projection -> contiguous column runs. Handwritten glyphs split
+    # by the shirorekha strip (e.g. tra's detached bars) leave 3-10 px gaps
+    # between their own parts, while separate characters sit far apart, so a
+    # ~5 px bridge reunites glyph parts without fusing distinct characters.
+    merge_gap = 5
+    segments = []
+    run_start, run_gap = None, 0
+    for x in range(line_w):
+        if col_ink[x] > 0:
+            if run_start is None:
+                run_start = x
+            run_gap = 0
+        elif run_start is not None:
+            run_gap += 1
+            if run_gap > merge_gap:
+                segments.append((run_start, x - run_gap))
+                run_start, run_gap = None, 0
+    if run_start is not None:
+        segments.append((run_start, line_w - 1))
+
+    # Union bounding box per column range, measured on the ORIGINAL binary
+    char_boxes = []
+    for (sx1, sx2) in segments:
+        region = binary[:, sx1:sx2 + 1]
+        ys, xs_in = np.where(region > 0)
+        if len(ys) == 0:
+            continue
+        x1, x2 = sx1 + xs_in.min(), sx1 + xs_in.max()
+        y1, y2 = ys.min(), ys.max()
+        if (x2 - x1) < 4 or (y2 - y1) < 8 or (x2 - x1 + 1) * (y2 - y1 + 1) < 32:
+            continue    # speck of noise
+        pad = 2
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(line_w, x2 + 1 + pad)
+        y2 = min(line_h, y2 + 1 + pad)
+        char_boxes.append((x1, y1, x2, y2))
+
+    # Sort boxes left-to-right
+    char_boxes.sort(key=lambda b: b[0])
+
+    # Rebuild whole glyphs: parts of one character separated by the
+    # shirorekha strip (e.g. a vertical whose only link to the body ran
+    # through the head-stroke) sit a few px apart, while distinct characters
+    # are spaced far wider. Union boxes whose horizontal gap is below ~25%
+    # of the line's median glyph height.
+    if char_boxes:
+        med_h = np.median([b[3] - b[1] for b in char_boxes])
+        merged = [char_boxes[0]]
+        for box in char_boxes[1:]:
+            m = merged[-1]
+            if box[0] - m[2] < 0.25 * med_h:
+                merged[-1] = (min(m[0], box[0]), min(m[1], box[1]),
+                              max(m[2], box[2]), max(m[3], box[3]))
+            else:
+                merged.append(box)
+        char_boxes = merged
+
+        # Drop dust: boxes far shorter than the median glyph height are
+        # binarization noise (paper texture, fold shadows), not characters.
+        med_h = np.median([b[3] - b[1] for b in char_boxes])
+        char_boxes = [b for b in char_boxes if (b[3] - b[1]) >= 0.25 * med_h]
+
+    return char_boxes
+
+
+def extract_line_crops(gray_image):
+    """
+    Extracts full horizontal sentence lines from document image using 
+    horizontal projection profiles.
+    """
+    _, binary = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Morphological dilation horizontally to bridge character gaps within words.
+    # The width adapts to the page: a fixed 25px kernel cannot bridge the large
+    # gaps of spaced-out handwriting grids, where every character then falsely
+    # becomes its own "line" (and is later fragmented by shirorekha removal).
+    # The 2px height keeps separate text rows from ever merging.
+    h_img, w_img = binary.shape
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(25, w_img // 4), 2))
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+    
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    line_boxes = []
+    
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w > 20 and h > 10:
+            line_boxes.append((x, y, x + w, y + h))
+            
+    # Sort top-to-bottom
+    line_boxes.sort(key=lambda b: b[1])
+    return line_boxes
+
+
+# ============================================================================
+#  SECTION 5: DATASET LOADER & TRAINER
+# ============================================================================
+
+class DevanagariDataset(Dataset):
+    """
+    PyTorch Dataset wrapper for Devanagari character datasets stored in folder hierarchy:
+    root_dir/
+      ├── character_1_ka/
+      ├── character_2_kha/
+      └── ...
+    """
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+        self.classes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
+        self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
+        
+        for cls_name in self.classes:
+            cls_folder = os.path.join(root_dir, cls_name)
+            for fname in os.listdir(cls_folder):
+                if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                    self.samples.append((os.path.join(cls_folder, fname), self.class_to_idx[cls_name]))
+                    
+    def __len__(self):
+        return len(self.samples)
+        
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        image = Image.open(path).convert('L')  # Convert to Grayscale
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
+def train_devanagari_model(data_dir, output_model_path="devanagari_cnn.pth", epochs=15, batch_size=128, lr=1e-3):
+    """
+    Train PyTorch Devanagari CNN model with augmentations and learning rate scheduling.
+    """
+    device = get_device()
+    print(f"\n[TRAIN] Initializing Training on Device: {device} ({describe_device(device)})")
+    
+    # Image Augmentation Transformations
+    train_transform = T.Compose([
+        T.Resize((32, 32)),
+        T.RandomRotation(degrees=10, fill=0),
+        T.RandomAffine(degrees=0, translate=(0.08, 0.08), scale=(0.92, 1.08)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.5], std=[0.5])
+    ])
+    
+    val_transform = T.Compose([
+        T.Resize((32, 32)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.5], std=[0.5])
+    ])
+    
+    # Locate the training folder (accepts both "Train" and "train" layouts)
+    train_path = data_dir
+    for name in ("Train", "train"):
+        if os.path.isdir(os.path.join(data_dir, name)):
+            train_path = os.path.join(data_dir, name)
+            break
+
+    if not os.path.isdir(train_path):
+        print(f"[ERROR] Training path not found: {train_path}")
+        return None
+
+    # Two dataset views over the same files: validation must never receive
+    # the training augmentations (a shared transform would leak them into
+    # the val metrics).
+    train_full = DevanagariDataset(train_path, transform=train_transform)
+    classes = train_full.classes
+    class_to_idx = train_full.class_to_idx
+    num_classes = len(classes)
+
+    val_dir = next((os.path.join(data_dir, n) for n in ("Val", "val")
+                    if os.path.isdir(os.path.join(data_dir, n))), None)
+
+    if val_dir:
+        train_dataset = train_full
+        val_dataset = DevanagariDataset(val_dir, transform=val_transform)
+    else:
+        # No dedicated val folder: carve a stratified 10% hold-out from the
+        # training set. The held-out Test/ split stays untouched so that
+        # evaluate_accuracy.py reports an unbiased final accuracy.
+        eval_view = DevanagariDataset(train_path, transform=val_transform)
+        targets = np.array([label for _, label in train_full.samples])
+        train_idx, val_idx = train_test_split(
+            np.arange(len(targets)), test_size=0.1,
+            random_state=42, stratify=targets)
+        train_dataset = Subset(train_full, train_idx.tolist())
+        val_dataset = Subset(eval_view, val_idx.tolist())
+        print(f"[TRAIN] No val folder found - using a stratified 10% hold-out "
+              f"({len(val_dataset)} images) carved from the training set.")
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    print(f"[TRAIN] Loaded {len(train_dataset)} training samples across {num_classes} classes.")
+    
+    model = DevanagariCNN(num_classes=num_classes).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.5)
+    
+    best_val_acc = 0.0
+    
+    for epoch in range(epochs):
+        model.train()
+        running_loss, correct, total = 0.0, 0, 0
+        
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * images.size(0)
+            _, preds = torch.max(outputs, 1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            
+        train_loss = running_loss / total
+        train_acc = correct / total
+        
+        # Validation
+        model.eval()
+        val_loss, val_correct, val_total = 0.0, 0, 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item() * images.size(0)
+                _, preds = torch.max(outputs, 1)
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+                
+        val_loss = val_loss / val_total
+        val_acc = val_correct / val_total
+        scheduler.step(val_loss)
+        
+        print(f"Epoch [{epoch+1:02d}/{epochs:02d}] "
+              f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% "
+              f"|| Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
+              
+        if val_acc >= best_val_acc:
+            best_val_acc = val_acc
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'classes': classes,
+                'class_to_idx': class_to_idx,
+                'accuracy': val_acc
+            }, output_model_path)
+            print(f"  --> Saved new best checkpoint to '{output_model_path}' (Val Acc: {val_acc*100:.2f}%)")
+            
+    return model
+
+
+# ============================================================================
+#  SECTION 6: INFERENCE PIPELINE & DOCUMENT RECONSTRUCTION
+# ============================================================================
+
+class DevanagariOCRRecognizer:
+    """
+    Inference Engine loading custom PyTorch Devanagari CNN model and performing 
+    character-level recognition on segmented document patches.
+    """
+    def __init__(self, model_path="devanagari_cnn.pth"):
+        self.device = get_device()
+        
+        self.transform = T.Compose([
+            T.Resize((32, 32)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.5], std=[0.5])
+        ])
+        
+        if os.path.exists(model_path):
+            print(f"[OCR Engine] Loading weights from '{model_path}'...")
+            checkpoint = torch.load(model_path, map_location=self.device)
+            self.classes = checkpoint['classes']
+            self.model = DevanagariCNN(num_classes=len(self.classes)).to(self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.eval()
+            print(f"[OCR Engine] Model loaded successfully on {self.device}.")
+        else:
+            print(f"[WARN] Weight file '{model_path}' not found. Initializing untrained CNN model for testing.")
+            self.classes = [v[0] for k, v in DHCD_LABEL_MAP.items()]
+            self.model = DevanagariCNN(num_classes=46).to(self.device)
+            self.model.eval()
+
+    def predict_patch(self, crop_gray):
+        """Perform forward pass on isolated character crop."""
+        # Snap the crop to the training domain's pure black/white contrast:
+        # real photos leave medium-gray, textured strokes after enhancement,
+        # while DHCD crops are clean binarized glyphs.
+        _, crop_gray = cv2.threshold(crop_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        h, w = crop_gray.shape
+        max_dim = max(h, w)
+
+        # Match DHCD framing: training glyphs occupy only ~80-88% of their
+        # 32x32 frame. A tight inference crop (100% occupancy) is out of
+        # distribution, so pad each side by ~10% of the glyph size first.
+        margin = int(round(0.10 * max_dim))
+        padded = np.full((max_dim + 2 * margin, max_dim + 2 * margin), 255, dtype=np.uint8)
+        padded[margin:margin + h, margin:margin + w] = crop_gray
+
+        # Invert for neural network input (Text = White, Background = Black)
+        padded_inv = cv2.bitwise_not(padded)
+
+        pil_img = Image.fromarray(padded_inv)
+        tensor_img = self.transform(pil_img).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(tensor_img)
+            probs = F.softmax(logits, dim=1)
+            conf, pred_idx = torch.max(probs, dim=1)
+
+        cls_name = self.classes[pred_idx.item()]
+        # Translate folder label name to actual Unicode Devanagari character
+        unicode_char = FOLDER_TO_UNICODE.get(cls_name, cls_name)
+        return unicode_char, conf.item()
+
+
+def group_into_lines(detections, line_threshold_ratio=0.6):
+    """
+    Groups character detections into top-to-bottom document lines and sorts 
+    each line left-to-right.
+    """
+    if not detections:
+        return []
+
+    annotated = []
+    for (bbox, text, conf) in detections:
+        x1, y1, x2, y2 = bbox_to_xyxy(bbox)
+        y_center = (y1 + y2) / 2.0
+        height = max(y2 - y1, 1)
+        annotated.append((y_center, height, bbox, text, conf))
+
+    annotated.sort(key=lambda item: item[0])
+
+    lines = []
+    current_line = []
+    current_y_sum = 0.0
+    current_y_avg = 0.0
+
+    for (y_center, height, bbox, text, conf) in annotated:
+        if not current_line:
+            current_line.append((bbox, text, conf))
+            current_y_sum = y_center
+            current_y_avg = y_center
+        else:
+            tolerance = line_threshold_ratio * height
+            if abs(y_center - current_y_avg) <= tolerance:
+                current_line.append((bbox, text, conf))
+                current_y_sum += y_center
+                current_y_avg = current_y_sum / len(current_line)
+            else:
+                current_line.sort(key=lambda item: bbox_to_xyxy(item[0])[0])
+                lines.append(current_line)
+                current_line = [(bbox, text, conf)]
+                current_y_sum = y_center
+                current_y_avg = y_center
+
+    if current_line:
+        current_line.sort(key=lambda item: bbox_to_xyxy(item[0])[0])
+        lines.append(current_line)
+
+    return lines
+
+
+def run_pipeline(image_path, model_path="devanagari_cnn.pth", min_confidence=0.10):
+    """
+    Full pipeline entry point for image inference.
+    """
+    if not os.path.exists(image_path):
+        print(f"[ERROR] Input image not found: {image_path}")
+        return
+
+    print("\n" + "═" * 70)
+    print("   RUNNING PYTORCH DEVANAGARI OCR PIPELINE")
+    print("═" * 70)
+
+    # Step 1: Load image
+    orig = cv2.imread(image_path)
+    if orig is None:
+        print(f"[ERROR] cv2.imread failed on {image_path}")
+        return
+        
+    print(f"[STEP 1] Image loaded ({orig.shape[1]}x{orig.shape[0]} px)")
+
+    # Step 2: Preprocess Image
+    enhanced_gray = full_preprocessing_pipeline(orig)
+    display_img = cv2.resize(orig, (enhanced_gray.shape[1], enhanced_gray.shape[0]))
+    print("[STEP 2] Applied enhancement chain (Shadow removal, Deskew, CLAHE, Line erase)")
+
+    # Step 3: Segment Lines & Characters
+    line_boxes = extract_line_crops(enhanced_gray)
+    print(f"[STEP 3] Detected {len(line_boxes)} candidate document line regions")
+
+    # Step 4: PyTorch Recognition Engine
+    recognizer = DevanagariOCRRecognizer(model_path=model_path)
+    all_detections = []
+
+    for line_idx, (lx1, ly1, lx2, ly2) in enumerate(line_boxes):
+        line_crop = enhanced_gray[ly1:ly2, lx1:lx2]
+        if line_crop.size == 0:
+            continue
+            
+        char_boxes = segment_characters_from_line(line_crop)
+        
+        for (cx1, cy1, cx2, cy2) in char_boxes:
+            char_crop = line_crop[cy1:cy2, cx1:cx2]
+            if char_crop.size == 0:
+                continue
+                
+            pred_char, confidence = recognizer.predict_patch(char_crop)
+            
+            # Global bounding box coordinates
+            gx1 = lx1 + cx1
+            gy1 = ly1 + cy1
+            gx2 = lx1 + cx2
+            gy2 = ly1 + cy2
+            
+            if confidence >= min_confidence:
+                bbox_format = [[gx1, gy1], [gx2, gy1], [gx2, gy2], [gx1, gy2]]
+                all_detections.append((bbox_format, pred_char, confidence))
+
+    print(f"[STEP 4] Recognized {len(all_detections)} character candidates")
+
+    # Step 5: Group Detections into Reading Order
+    text_lines = group_into_lines(all_detections, line_threshold_ratio=0.6)
+
+    # Step 6: Export Results & Draw Visual Overlays
+    output_txt = "extracted_devanagari.txt"
+    output_img = "ocr_output_visual.png"
+
+    with open(output_txt, "w", encoding="utf-8") as f:
+        print("\n" + "═" * 70)
+        print("  EXTRACTED TEXT OUTPUT")
+        print("═" * 70)
+        for i, line_items in enumerate(text_lines, 1):
+            line_str = "".join([item[1] for item in line_items])
+            print(f"  Line {i:02d}: {line_str}")
+            f.write(line_str + "\n")
+            
+            for (bbox, text, conf) in line_items:
+                x1, y1, x2, y2 = bbox_to_xyxy(bbox)
+                color = (0, 220, 0) if conf > 0.8 else ((0, 220, 220) if conf > 0.5 else (0, 0, 220))
+                cv2.rectangle(display_img, (x1, y1), (x2, y2), color, 1)
+
+    cv2.imwrite(output_img, display_img)
+    print("═" * 70)
+    print(f"[SUCCESS] Results exported to:\n  📄 Text File: {output_txt}\n  🖼 Visual Map: {output_img}\n")
+
+
+# ============================================================================
+#  SECTION 7: MAIN EXECUTION CLI INTERFACE
+# ============================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="PyTorch Devanagari OCR Engine & Trainer")
+    parser.add_argument("--mode", type=str, default="infer", choices=["infer", "train"], help="Operation mode: infer or train")
+    parser.add_argument("--image", type=str, default="my_handwriting.jpeg", help="Path to input image for OCR inference")
+    parser.add_argument("--data_dir", type=str, default="DevanagariHandwrittenCharacterDataset", help="Directory containing the DHCD dataset for training")
+    parser.add_argument("--model_path", type=str, default="devanagari_cnn.pth", help="Path to save/load model checkpoint")
+    parser.add_argument("--epochs", type=int, default=10, help="Epochs for training mode")
+
+    args = parser.parse_args()
+
+    if args.mode == "train":
+        if not os.path.isdir(args.data_dir):
+            print(f"[ERROR] Dataset directory not found: {args.data_dir}")
+            sys.exit(1)
+
+        train_devanagari_model(data_dir=args.data_dir, output_model_path=args.model_path, epochs=args.epochs)
+    else:
+        if not os.path.exists(args.image):
+            print(f"[ERROR] Input image not found: {args.image}")
+            sys.exit(1)
+
+        run_pipeline(image_path=args.image, model_path=args.model_path)
