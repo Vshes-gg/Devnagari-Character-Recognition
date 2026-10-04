@@ -280,14 +280,33 @@ def bilateral_denoise(gray):
 
 
 def remove_ruled_lines(gray):
-    """Isolate and erase notebook horizontal ruled lines via morphological opening."""
+    """Isolate and erase notebook ruled lines.
+
+    Horizontal rules are caught by morphological opening with a wide kernel.
+    Vertical margin lines need column statistics instead: printed margin
+    lines are faint and broken, so openings miss segments (and inpainting
+    resurrects erased segments from their surviving twin). A column whose
+    ink spans a large fraction of the page height AND is densely filled is
+    a rule, not text - real text columns are sparse (a dense page fills a
+    column with only a few percent of ink, a margin line with 30-50%).
+    """
     h, w = gray.shape
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel_width = max(30, w // 4)
-    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
-    line_mask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
-    line_mask = cv2.dilate(line_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)), iterations=1)
-    
+
+    line_mask = np.zeros_like(binary)
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, w // 4), 1))
+    line_mask |= cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+
+    ink = binary > 0
+    has_ink = ink.any(axis=0)
+    first = np.where(has_ink, ink.argmax(axis=0), 0)
+    last = np.where(has_ink, h - 1 - ink[::-1].argmax(axis=0), 0)
+    fill = ink.sum(axis=0) / float(h)
+    span = (last - first + 1) / float(h)
+    for x in np.where((span > 0.33) & (fill > 0.15))[0]:
+        line_mask[:, max(0, x - 4):x + 5] = 255
+
+    line_mask = cv2.dilate(line_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=1)
     result = gray.copy()
     result[line_mask == 255] = 255
     return cv2.inpaint(result, line_mask, inpaintRadius=2, flags=cv2.INPAINT_TELEA)
@@ -299,13 +318,33 @@ def full_preprocessing_pipeline(image_bgr):
     if h < 1200:
         scale = 1200 / h
         image_bgr = cv2.resize(image_bgr, (int(w * scale), 1200), interpolation=cv2.INTER_CUBIC)
-        
+
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     gray = remove_shadows(gray)
     gray = deskew(gray)
     gray = apply_clahe(gray)
     gray = bilateral_denoise(gray)
     gray = remove_ruled_lines(gray)
+
+    # Text-scale guard: a page can be large while its text is small (e.g.
+    # 1280px tall with ~30px pencil characters). Thin faint strokes vanish
+    # at binarization at that size, so upscale until the median text row
+    # reaches ~52px - the size at which segmentation stays reliable.
+    # The median runs over SIGNIFICANT bands only (>= page height / 40):
+    # fold shadows and binarization noise create many small bands that would
+    # otherwise dominate the median on crumpled paper and trigger a pointless
+    # upscale of an already-readable page.
+    line_boxes = extract_line_crops(gray)
+    sig = max(12, gray.shape[0] // 40)
+    heights = [y2 - y1 for (_, y1, _, y2) in line_boxes if (y2 - y1) >= sig]
+    if heights:
+        median_h = float(np.median(heights))
+        if median_h < 52:
+            scale = min(52.0 / median_h, 4.0)
+            gray = cv2.resize(gray, (int(gray.shape[1] * scale), int(gray.shape[0] * scale)),
+                              interpolation=cv2.INTER_CUBIC)
+            print(f"  [preprocess] text rows ~{median_h:.0f}px tall - upscaling x{scale:.2f}")
+
     return gray
 
 
@@ -342,7 +381,7 @@ def segment_characters_from_line(line_gray):
     matching how DHCD training glyphs are framed.
     """
     # Binarize line: Text = White, Background = Black
-    _, binary = cv2.threshold(line_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    binary = _ink_binary(line_gray)
 
     # Strip Shirorekha (used only to find column boundaries)
     char_binary, _ = remove_shirorekha(binary)
@@ -417,34 +456,123 @@ def segment_characters_from_line(line_gray):
         med_h = np.median([b[3] - b[1] for b in char_boxes])
         char_boxes = [b for b in char_boxes if (b[3] - b[1]) >= 0.25 * med_h]
 
+        # Drop stroke slivers: boxes much narrower than both their own height
+        # and the line's widest glyph (e.g. a vertical separated from its
+        # glyph body by the shirorekha strip) classify as junk bars/digits.
+        # Real narrow glyphs (like १) survive via the aspect-ratio escape.
+        max_w = max(b[2] - b[0] for b in char_boxes)
+        char_boxes = [b for b in char_boxes
+                      if (b[2] - b[0]) >= 0.25 * (b[3] - b[1])
+                      or (b[2] - b[0]) >= 0.3 * max_w]
+
     return char_boxes
+
+
+def _ink_binary(gray):
+    """Binarize a page or line, choosing the binarizer by ink contrast.
+
+    - Dark-ink pages (pen): global Otsu separates strokes from everything,
+      including crumpled-paper fold shadows, which adaptive thresholding
+      would wrongly mark as ink (every fold is locally darker than its
+      neighborhood).
+    - Faint-pencil pages: Otsu's threshold lands between the paper's texture
+      peaks and the strokes, so texture binarizes as ink while faint
+      characters drop out entirely. Adaptive thresholding follows the local
+      paper level instead, keeping light strokes and rejecting texture.
+
+    The two regimes are told apart by the darkness gap between Otsu's ink
+    class and the rest of the page: a large gap means strong, reliably
+    separable ink (use Otsu); a small gap means faint pencil (use adaptive).
+    """
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    t_otsu, otsu_binary = cv2.threshold(blur, 0, 255,
+                                        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    ink = blur < t_otsu
+    if ink.any() and (~ink).any():
+        contrast = blur[~ink].mean() - blur[ink].mean()
+        if contrast >= 50:
+            return otsu_binary
+    return cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY_INV, 51, 12)
 
 
 def extract_line_crops(gray_image):
     """
-    Extracts full horizontal sentence lines from document image using 
-    horizontal projection profiles.
+    Extracts full horizontal sentence lines using horizontal projection
+    profiles on the dust-cleaned ink binary.
+
+    A line is a run of rows that carry meaningful ink. The per-row floor is
+    relative to each band's peak: fold-shadow creases on crumpled paper cross
+    a band with only a few ink pixels per row (a dash contributes 2-10px),
+    while every row through real glyphs carries the sum of the stroke widths
+    it crosses — so crease rows act as gaps and split or drop out, and
+    whatever the characters' horizontal spacing, one band per written row
+    remains. Each line's box spans the full x-extent of its band's ink.
     """
-    _, binary = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # Morphological dilation horizontally to bridge character gaps within words.
-    # The width adapts to the page: a fixed 25px kernel cannot bridge the large
-    # gaps of spaced-out handwriting grids, where every character then falsely
-    # becomes its own "line" (and is later fragmented by shirorekha removal).
-    # The 2px height keeps separate text rows from ever merging.
-    h_img, w_img = binary.shape
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(25, w_img // 4), 2))
-    dilated = cv2.dilate(binary, kernel, iterations=1)
-    
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    binary = _ink_binary(gray_image)
+    H, W = binary.shape
+
+    # Remove dust components (fold-shadow dashes on crumpled paper, paper
+    # specks) before profiling: real glyphs are far larger than H/60 at this
+    # stage; upper-zone matras are unaffected because character segmentation
+    # re-binarizes each line crop without this filter.
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    for i in range(1, num):
+        if max(stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]) < H // 60:
+            binary[labels == i] = 0
+
+    row_ink = (binary > 0).sum(axis=1)
+
+    # Raw bands: contiguous runs of rows with any ink (small gaps bridged)
+    raw = []
+    start, gap = None, 0
+    bridge0 = max(3, H // 200)
+    for y in range(H):
+        if row_ink[y] > 0:
+            if start is None:
+                start = y
+            gap = 0
+        elif start is not None:
+            gap += 1
+            if gap > bridge0:
+                raw.append((start, y - gap + 1))
+                start = None
+    if start is not None:
+        raw.append((start, H))
+
+    # Split raw bands at internal crease valleys: rows far below the band's
+    # peak ink are crease crossings, not text.
+    bands = []
+    min_gap = max(8, H // 150)
+    for (y1, y2) in raw:
+        seg = row_ink[y1:y2]
+        floor = max(6, int(0.08 * seg.max()))
+        sub_start, gap = None, 0
+        for i, v in enumerate(seg):
+            if v >= floor:
+                if sub_start is None:
+                    sub_start = i
+                gap = 0
+            elif sub_start is not None:
+                gap += 1
+                if gap > min_gap:
+                    bands.append((y1 + sub_start, y1 + i - gap + 1))
+                    sub_start = None
+        if sub_start is not None:
+            bands.append((y1 + sub_start, y1 + len(seg)))
+
+    # Line boxes: x-extent of the band's ink; drop dust-height bands
     line_boxes = []
-    
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if w > 20 and h > 10:
-            line_boxes.append((x, y, x + w, y + h))
-            
-    # Sort top-to-bottom
+    min_h = max(10, H // 200)
+    for (y1, y2) in bands:
+        if y2 - y1 < min_h:
+            continue
+        strip = binary[y1:y2]
+        xs = np.where(strip.any(axis=0))[0]
+        if len(xs) == 0:
+            continue
+        line_boxes.append((int(xs.min()), int(y1), int(xs.max()) + 1, int(y2)))
+
     line_boxes.sort(key=lambda b: b[1])
     return line_boxes
 

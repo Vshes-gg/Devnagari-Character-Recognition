@@ -55,6 +55,33 @@ All 10 glyph predictions came back at 0.99–1.00 confidence. Per-glyph
 correctness on free handwriting depends on how closely the writing style
 resembles DHCD — use the verification sheet to check each glyph.
 
+A second, harder page is included as a stress test:
+[`Sandesh_Handwriting.jpeg`](Sandesh_Handwriting.jpeg) — *faint pencil* on
+*ruled notebook paper* with a red margin line. It exercises the robustness
+path (vertical margin-line removal, adaptive binarization, text-scale
+upscale): outputs in `sandesh_extracted.txt` / `sandesh_ocr_visual.png`.
+Detection recovers all rows, but per-character accuracy is much lower than
+the demo page — see [Input tips](#input-tips).
+
+A third stress test, [`crumpled_paper_test.png`](crumpled_paper_test.png) —
+pen on heavily crumpled paper — exercises the fold-shadow path: Otsu
+selection, dust-component removal, and projection-profile line detection
+with crease-valley splitting. All glyphs are located; outputs in
+`crumpled_extracted.txt` / `crumpled_ocr_visual.png` +
+`crumpled_glyph_verification.png`.
+
+### Input tips
+
+The model is trained on dark-ink felt-pen samples (DHCD), so capture quality
+dominates page-level accuracy:
+
+- **Pen beats pencil.** Light pencil on textured paper is the hardest case:
+  stroke contrast can fall below the paper's own texture level.
+- Fill the frame — photograph close so characters are large, straight-on so
+  rows stay horizontal.
+- Even light; avoid shadows and paper folds in the text area.
+- Write characters separately (clear gaps) or as words with normal spacing.
+
 ---
 
 ## Setup
@@ -103,13 +130,17 @@ photo ─► preprocessing ─► line segmentation ─► character segmentatio
 
 1. **Preprocess** — upscale small photos, lift shadows
    (divide-by-background), deskew, CLAHE, bilateral denoise, erase ruled
-   lines.
-2. **Segment lines** — Otsu binarize, horizontal dilation with a
-   page-width-adaptive kernel, contour boxes.
+   lines and vertical margin lines, then upscale again until the median
+   text row reaches ~52px (small faint text breaks at binarization).
+2. **Segment lines** — binarize by measured ink contrast (Otsu for dark-ink
+   pages, adaptive for faint pencil), drop dust components, then horizontal
+   projection profiles: rows whose ink dips to a fraction of the band's peak
+   (fold-shadow creases) split or drop out.
 3. **Segment characters** — shirorekha (head-stroke) removal, then vertical
    projection; glyph fragments separated by the strip are re-unioned by
-   glyph-scale proximity, and union boxes are measured on the original
-   binary so the shirorekha stays in the crop (like DHCD framing).
+   glyph-scale proximity, dust and stroke-sliver boxes are dropped, and
+   union boxes are measured on the original binary so the shirorekha stays
+   in the crop (like DHCD framing).
 4. **Classify** — each crop is binarized, padded to DHCD's ~85% glyph
    framing, inverted to the training polarity, and pushed through the CNN.
 5. **Assemble** — detections are grouped into lines by y-center and sorted

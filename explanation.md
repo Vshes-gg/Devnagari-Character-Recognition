@@ -96,7 +96,18 @@ close to the training data's clean rendering:
 | Deskew | `deskew()` | `minAreaRect` on all ink pixels → rotate page-level tilt flat |
 | CLAHE | `apply_clahe()` | tile-wise contrast normalization so faint strokes show up |
 | Bilateral filter | `bilateral_denoise()` | smooths paper texture/noise while keeping stroke edges sharp |
-| Ruled-line erase | `remove_ruled_lines()` | morphological opening finds long horizontal rules, then inpaints them away |
+| Ruled-line erase | `remove_ruled_lines()` | horizontal rules by morphological opening; **vertical margin lines by column statistics** (faint/broken margin lines evade openings, and inpainting resurrects them from their twin) |
+| Text-scale guard | end of pipeline | if the median text row is under ~52px, the page is upscaled (capped ×4) — thin faint strokes vanish at binarization when characters are ~30px tall |
+
+**How binarization works downstream** — `_ink_binary()` chooses the
+binarizer by measured ink contrast. Dark-ink pages (pen) use **global Otsu**:
+strokes separate cleanly from everything, including crumpled-paper fold
+shadows, which adaptive thresholding would wrongly mark as ink (every fold
+is locally darker than its neighborhood). Faint-pencil pages use **adaptive
+thresholding** (local mean − offset): Otsu's threshold would land between
+the paper's texture peaks and the strokes, so texture would binarize as ink
+while faint characters drop out. The two regimes are told apart by the
+darkness gap between Otsu's ink class and the rest of the page.
 
 **How `remove_shadows()` works** — illumination flattening by
 divide-by-background: a large dilation + Gaussian blur estimates the
@@ -104,25 +115,27 @@ divide-by-background: a large dilation + Gaussian blur estimates the
 it (`ink/paper × 255`). A uniformly-lit page comes out unchanged; a shadowed
 page comes out with the shadow lifted, keeping only ink darkness.
 
-The engine's own enhancements are binarization-friendly: after this chain,
-Otsu thresholding separates strokes from paper almost perfectly (verified on
-real phone photos of handwriting).
-
 ---
 
 ## Section 4: Segmentation (pages → lines → characters)
 
 ### `extract_line_crops()` — find text lines
 
-Otsu-binarize (ink = white), then **dilate horizontally** so the characters
-of one row merge into a single blob, and take external contours: each
-contour is one text line. Boxes are sorted top-to-bottom.
+Line detection works on the **dust-cleaned ink binary** (see
+`_ink_binary` in Section 3) via **horizontal projection profiles**:
 
-The kernel width **adapts to the page** (`max(25, width/4)`): a fixed 25px
-kernel cannot bridge the large gaps of spaced-out handwriting grids — every
-character then falsely becomes its own "line" and is later fragmented. The
-2px kernel height keeps separate text rows from ever merging, so over-wide
-bridging inside a row is always safe.
+1. **Dust removal**: connected components smaller than page_height/60 are
+   erased first — fold-shadow dashes on crumpled paper and paper specks.
+   Left in place, the line-merging step would smear a single speck into a
+   full-width phantom text line.
+2. **Row bands**: contiguous runs of rows with any ink (tiny gaps bridged).
+3. **Crease-valley splitting**: within each band, rows far below the band's
+   peak ink (a dash contributes 2–10px per row; a row through real glyphs
+   carries the sum of all stroke widths it crosses) act as gaps — merged
+   rows split apart and crease-only bands drop out.
+4. Each line's box spans the full x-extent of its band's ink; dust-height
+   bands are dropped. One band per written row remains, however far apart
+   the characters are spaced.
 
 ### `remove_shirorekha()` — cut the head-stroke
 
@@ -151,7 +164,10 @@ characters are located by **vertical projection** on the stripped binary:
    characters sit far wider — boxes whose horizontal gap is below ~25% of
    the line's median glyph height are unioned back together.
 4. Dust filter: boxes far shorter than the median glyph height are
-   binarization noise, not characters.
+   binarization noise, not characters. Stroke slivers (much narrower than
+   both their own height and the line's widest glyph — a vertical whose
+   glyph body was separated) are dropped too: classifying them yields junk
+   bars and digits.
 
 Boxes are padded 2px and sorted left-to-right.
 
