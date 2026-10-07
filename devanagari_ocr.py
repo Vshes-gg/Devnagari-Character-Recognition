@@ -86,6 +86,7 @@ DHCD_LABEL_MAP = {
 # Reverse mapping from folder/class name to Devanagari character
 FOLDER_TO_UNICODE = {v[0]: v[1] for k, v in DHCD_LABEL_MAP.items()}
 INDEX_TO_UNICODE = {k: v[1] for k, v in DHCD_LABEL_MAP.items()}
+DIGIT_UNICODE = {v[1] for k, v in DHCD_LABEL_MAP.items() if v[0].startswith("digit_")}
 
 
 # ============================================================================
@@ -282,29 +283,46 @@ def bilateral_denoise(gray):
 def remove_ruled_lines(gray):
     """Isolate and erase notebook ruled lines.
 
-    Horizontal rules are caught by morphological opening with a wide kernel.
-    Vertical margin lines need column statistics instead: printed margin
-    lines are faint and broken, so openings miss segments (and inpainting
-    resurrects erased segments from their surviving twin). A column whose
-    ink spans a large fraction of the page height AND is densely filled is
-    a rule, not text - real text columns are sparse (a dense page fills a
-    column with only a few percent of ink, a margin line with 30-50%).
+    Horizontal rules are caught by morphological opening with a wide kernel;
+    vertical margin lines by opening with a tall kernel - both filtered by
+    rule SHAPE afterwards (long and thin at the page's scale). The shape
+    filter is what protects the writing: a close-up photo's shirorekha can
+    be hundreds of px long but never spans half the page, and stacked letter
+    stems never form one continuous vertical run the way a margin line does.
+
+    The opening result is filtered by rule SHAPE before it may touch the
+    page: a rule spans most of the page width and is thinner than any text
+    stroke at that scale. On close-up photos a long word's shirorekha can
+    be hundreds of px long, but it never spans half the page, so the width
+    floor - not a longer kernel alone - is what keeps the head-stroke out
+    of the erase mask.
     """
     h, w = gray.shape
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, w // 2), 1)), iterations=1)
+    # Vertical margin lines by the same principle: a CONTINUOUS vertical ink
+    # run. Column statistics cannot do this job - on close-up photos, thick
+    # letter stems stacked over several text rows mimic a margin's span and
+    # fill, while on a half-page photo a real margin spans too little to
+    # pass any sane span floor. Continuity separates them: a margin line is
+    # one unbroken run, letter stems are short runs with row gaps between.
+    opened |= cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, h // 8))), iterations=1)
     line_mask = np.zeros_like(binary)
-    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, w // 4), 1))
-    line_mask |= cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
-
-    ink = binary > 0
-    has_ink = ink.any(axis=0)
-    first = np.where(has_ink, ink.argmax(axis=0), 0)
-    last = np.where(has_ink, h - 1 - ink[::-1].argmax(axis=0), 0)
-    fill = ink.sum(axis=0) / float(h)
-    span = (last - first + 1) / float(h)
-    for x in np.where((span > 0.33) & (fill > 0.15))[0]:
-        line_mask[:, max(0, x - 4):x + 5] = 255
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+    for i in range(1, num):
+        cw, ch = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+        horizontal_rule = cw >= 0.45 * w and ch <= max(5, 0.005 * h)
+        # Vertical: thin partial-height lines are drawn margin lines; a
+        # full-height band can also be the page's dark edge/spine, which is
+        # fatter than any drawn line but still not text (no letter stroke
+        # forms a continuous run down the whole page).
+        vertical_rule = (ch >= 0.3 * h and cw <= max(5, 0.005 * h)) or \
+                        (ch >= 0.7 * h and cw <= max(8, 0.02 * h))
+        if horizontal_rule or vertical_rule:
+            line_mask[labels == i] = 255
 
     line_mask = cv2.dilate(line_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=1)
     result = gray.copy()
@@ -366,19 +384,89 @@ def remove_shirorekha(line_binary):
     return char_binary, shirorekha_mask
 
 
-def segment_characters_from_line(line_gray):
+def _too_wide(box, med_h, ratio=1.4):
+    """True when a box is wider than a single DHCD glyph can plausibly be.
+
+    Devanagari glyphs are roughly square to slightly tall; only joined
+    cursive words exceed ~1.4x their height (the three wide conjunct
+    classes क्ष त्र ज्ञ bottom out around 1.5-1.7, which is why the
+    geometric pre-splitter uses the higher ratio=1.7 and leaves anything
+    narrower to the classifier-guided refiner). Floating matras
+    (ा ी ो ...) are wide-but-short, so the height floor keeps them out.
+    Also used to stop the fragment-merge pass from re-fusing split pieces.
+    """
+    w, h = box[2] - box[0], box[3] - box[1]
+    return w > ratio * h and h >= 0.6 * med_h
+
+
+def _valley_cuts(prof_s, sx1, sx2, med_h):
+    """Column positions that cut a cursive-joined run into glyph pieces.
+
+    Joined letters leave no empty columns to cut at, so cut at the lowest
+    points of the smoothed ink projection instead - the neck where two
+    letter bodies join. Deepest valley first, then recurse into both halves
+    while a piece is still wider than a glyph can be. Cuts stay >= 22% of a
+    glyph height from the run's ends and >= 30% from each other, so no
+    sliver pieces are created here.
+    """
+    cuts = []
+    stack = [(sx1, sx2)]
+    while stack and len(cuts) < 24:
+        a, b = stack.pop()
+        if (b - a + 1) <= 1.4 * med_h:
+            continue
+        lo, hi = a + int(0.22 * med_h), b - int(0.22 * med_h)
+        if hi - lo < 2:
+            continue
+        cx = lo + int(np.argmin(prof_s[lo:hi + 1]))
+        cuts.append(cx)
+        stack.append((a, cx - 1))
+        stack.append((cx + 1, b))
+    cuts.sort()
+    filtered, last = [], sx1 - 1
+    for c in cuts:
+        if c - last >= 0.3 * med_h and sx2 - c >= 0.3 * med_h:
+            filtered.append(c)
+            last = c
+    return filtered
+
+
+def _projection_debug_image(col_ink, segments, cuts):
+    """Render the vertical ink projection for the --debug dump: ink profile
+    in gray, segment bounds in green, cursive-join cuts in red."""
+    h = 240
+    img = np.zeros((h, len(col_ink), 3), dtype=np.uint8)
+    peak = float(col_ink.max()) if len(col_ink) else 0.0
+    if peak <= 0:
+        peak = 1.0
+    for x, v in enumerate(col_ink):
+        y0 = h - 1 - int((h - 20) * (v / peak))
+        cv2.line(img, (x, h - 1), (x, y0), (200, 200, 200), 1)
+    for (sx1, sx2) in segments:
+        cv2.line(img, (sx1, 0), (sx1, h - 1), (0, 200, 0), 1)
+        cv2.line(img, (sx2, 0), (sx2, h - 1), (0, 200, 0), 1)
+    for c in cuts:
+        cv2.line(img, (c, 0), (c, h - 1), (0, 0, 255), 1)
+    return img
+
+
+def segment_characters_from_line(line_gray, debug_dir=None, line_tag="line"):
     """
     Splits a single text line into individual character crops.
 
-    Connected components on the shirorekha-stripped binary fragment
-    handwriting badly (subtracting the top bar disconnects upper loops and
-    matras from the body, and those fragments - classified alone - destroy
-    accuracy). Instead, characters are located by VERTICAL PROJECTION on the
-    stripped binary: contiguous inked column runs are candidate characters
-    (gaps of <=2 px are bridged). Each character's final box is the union
-    bounding box of ALL ink inside its column range measured on the ORIGINAL
-    binary - so the shirorekha and upper-zone matras stay inside the crop,
-    matching how DHCD training glyphs are framed.
+    Characters are located by VERTICAL PROJECTION on the shirorekha-stripped
+    binary: contiguous inked column runs are candidate characters (gaps of
+    <=5 px are bridged). Each character's final box is the union bounding
+    box of ALL ink inside its column range measured on the ORIGINAL binary -
+    so the shirorekha and upper-zone matras stay inside the crop, matching
+    how DHCD training glyphs are framed.
+
+    Natural cursive writing also joins neighboring letter BODIES below the
+    headline, so a whole word can form one column run with no empty column
+    to cut at (the run's box ends up wider than any single glyph). Such runs
+    are split at the lowest-ink valleys of the projection (_valley_cuts)
+    until every piece has a plausible single-glyph width; the recognizer
+    refines the exact cut positions later (refine_character_cuts).
     """
     # Binarize line: Text = White, Background = Black
     binary = _ink_binary(line_gray)
@@ -413,23 +501,53 @@ def segment_characters_from_line(line_gray):
     if run_start is not None:
         segments.append((run_start, line_w - 1))
 
-    # Union bounding box per column range, measured on the ORIGINAL binary
-    char_boxes = []
-    for (sx1, sx2) in segments:
+    def box_for_range(sx1, sx2):
+        # Union bounding box of a column range, measured on the ORIGINAL
+        # binary so shirorekha and matras stay inside the crop.
         region = binary[:, sx1:sx2 + 1]
         ys, xs_in = np.where(region > 0)
         if len(ys) == 0:
-            continue
+            return None
         x1, x2 = sx1 + xs_in.min(), sx1 + xs_in.max()
         y1, y2 = ys.min(), ys.max()
         if (x2 - x1) < 4 or (y2 - y1) < 8 or (x2 - x1 + 1) * (y2 - y1 + 1) < 32:
-            continue    # speck of noise
+            return None    # speck of noise
         pad = 2
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-        x2 = min(line_w, x2 + 1 + pad)
-        y2 = min(line_h, y2 + 1 + pad)
-        char_boxes.append((x1, y1, x2, y2))
+        return (max(0, x1 - pad), max(0, y1 - pad),
+                min(line_w, x2 + 1 + pad), min(line_h, y2 + 1 + pad))
+
+    # Glyph-height scale for the splitter, measured BEFORE splitting: word
+    # blobs are as tall as single glyphs, so the median is safe to use.
+    pre_boxes = [b for b in (box_for_range(s1, s2) for (s1, s2) in segments) if b]
+    med_h = float(np.median([b[3] - b[1] for b in pre_boxes])) if pre_boxes else 0.0
+
+    # Cursive-join splitting: re-cut too-wide runs at projection valleys.
+    join_cuts = []
+    if med_h >= 12:
+        smooth_k = max(3, int(med_h * 0.06) | 1)
+        prof_s = np.convolve(col_ink.astype(np.float64),
+                             np.ones(smooth_k) / smooth_k, mode="same")
+        refined_segments = []
+        for (sx1, sx2) in segments:
+            box = box_for_range(sx1, sx2)
+            if box is None:
+                continue
+            cuts = _valley_cuts(prof_s, sx1, sx2, med_h) if _too_wide(box, med_h, ratio=1.85) else []
+            if cuts:
+                join_cuts.extend(cuts)
+                edges = [sx1] + cuts + [sx2 + 1]
+                refined_segments.extend((edges[i], edges[i + 1] - 1)
+                                        for i in range(len(edges) - 1))
+            else:
+                refined_segments.append((sx1, sx2))
+        segments = refined_segments
+
+    # Union bounding box per column range, measured on the ORIGINAL binary
+    char_boxes = []
+    for (sx1, sx2) in segments:
+        box = box_for_range(sx1, sx2)
+        if box is not None:
+            char_boxes.append(box)
 
     # Sort boxes left-to-right
     char_boxes.sort(key=lambda b: b[0])
@@ -438,23 +556,29 @@ def segment_characters_from_line(line_gray):
     # shirorekha strip (e.g. a vertical whose only link to the body ran
     # through the head-stroke) sit a few px apart, while distinct characters
     # are spaced far wider. Union boxes whose horizontal gap is below ~25%
-    # of the line's median glyph height.
+    # of the line's median glyph height. The merge is refused when the union
+    # would be wider than a single glyph - without that guard the merge pass
+    # would instantly re-fuse the cursive-join pieces cut above.
     if char_boxes:
         med_h = np.median([b[3] - b[1] for b in char_boxes])
         merged = [char_boxes[0]]
         for box in char_boxes[1:]:
             m = merged[-1]
             if box[0] - m[2] < 0.25 * med_h:
-                merged[-1] = (min(m[0], box[0]), min(m[1], box[1]),
-                              max(m[2], box[2]), max(m[3], box[3]))
-            else:
-                merged.append(box)
+                u = (min(m[0], box[0]), min(m[1], box[1]),
+                     max(m[2], box[2]), max(m[3], box[3]))
+                if not _too_wide(u, med_h):
+                    merged[-1] = u
+                    continue
+            merged.append(box)
         char_boxes = merged
 
         # Drop dust: boxes far shorter than the median glyph height are
-        # binarization noise (paper texture, fold shadows), not characters.
+        # binarization noise (paper texture, fold shadows) or floating
+        # matra fragments (ी hooks that lost their word), not characters.
+        # Digits, the smallest real glyphs, sit near 0.7x of letter height.
         med_h = np.median([b[3] - b[1] for b in char_boxes])
-        char_boxes = [b for b in char_boxes if (b[3] - b[1]) >= 0.25 * med_h]
+        char_boxes = [b for b in char_boxes if (b[3] - b[1]) >= 0.35 * med_h]
 
         # Drop stroke slivers: boxes much narrower than both their own height
         # and the line's widest glyph (e.g. a vertical separated from its
@@ -465,7 +589,209 @@ def segment_characters_from_line(line_gray):
                       if (b[2] - b[0]) >= 0.25 * (b[3] - b[1])
                       or (b[2] - b[0]) >= 0.3 * max_w]
 
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(debug_dir, f"{line_tag}_a_line.png"), line_gray)
+        cv2.imwrite(os.path.join(debug_dir, f"{line_tag}_b_stripped.png"), char_binary)
+        cv2.imwrite(os.path.join(debug_dir, f"{line_tag}_c_projection.png"),
+                    _projection_debug_image(col_ink, segments, join_cuts))
+        vis = cv2.cvtColor(line_gray, cv2.COLOR_GRAY2BGR)
+        for b in char_boxes:
+            cv2.rectangle(vis, (b[0], b[1]), (b[2], b[3]), (0, 220, 0), 2)
+        cv2.imwrite(os.path.join(debug_dir, f"{line_tag}_d_boxes.png"), vis)
+
     return char_boxes
+
+
+def _local_minima(prof_s, lo, hi):
+    lo, hi = max(1, int(lo)), min(len(prof_s) - 2, int(hi))
+    return [x for x in range(lo, hi + 1)
+            if prof_s[x] <= prof_s[x - 1] and prof_s[x] <= prof_s[x + 1]]
+
+
+def refine_character_cuts(line_gray, char_boxes, recognizer, debug_dir=None, line_tag="line"):
+    """
+    Recognition-guided refinement of cursive-join cuts.
+
+    The geometric valley cut finds *a* joint; this pass lets the classifier
+    choose the best one. Adjacent boxes whose union is wider than a single
+    glyph (an unsplit word blob, or the pieces the geometric splitter just
+    produced) are re-sliced at candidate valley positions. Every candidate
+    slicing is scored by running the recognizer on its pieces:
+
+        score = sum(log(confidence_i) + width_prior_i)
+
+    where the width prior penalizes pieces too wide to be one glyph. Whole
+    blobs compete on the same scale, so keeping the blob only ever wins
+    when every proposed cut classifies as garbage: the classifier can move
+    cuts and pick cut counts, but it cannot un-split a joined word.
+    """
+    if not char_boxes or recognizer is None:
+        return char_boxes
+
+    med_h = float(np.median([b[3] - b[1] for b in char_boxes]))
+    if med_h < 12:
+        return char_boxes
+
+    binary = _ink_binary(line_gray)
+    char_binary, _ = remove_shirorekha(binary)
+    col_ink = (char_binary > 0).sum(axis=0).astype(np.float64)
+    smooth_k = max(3, int(med_h * 0.06) | 1)
+    prof_s = np.convolve(col_ink, np.ones(smooth_k) / smooth_k, mode="same")
+
+    line_h, line_w = line_gray.shape
+
+    def piece_box(a, b):
+        region = binary[:, a:b + 1]
+        ys, xs_in = np.where(region > 0)
+        if len(ys) == 0:
+            return None
+        x1, x2 = a + xs_in.min(), a + xs_in.max()
+        y1, y2 = ys.min(), ys.max()
+        if (x2 - x1) < 4 or (y2 - y1) < 8 or (x2 - x1 + 1) * (y2 - y1 + 1) < 32:
+            return None
+        pad = 2
+        return (max(0, x1 - pad), max(0, y1 - pad),
+                min(line_w, x2 + 1 + pad), min(line_h, y2 + 1 + pad))
+
+    def slice_score(cuts, a, b, apply_prior=True):
+        edges = [a] + list(cuts) + [b + 1]
+        total = 0.0
+        for i in range(len(edges) - 1):
+            pb = piece_box(edges[i], edges[i + 1] - 1)
+            if pb is None:
+                return -1e9
+            crop = line_gray[pb[1]:pb[3], pb[0]:pb[2]]
+            if crop.size == 0:
+                return -1e9
+            _, conf = recognizer.predict_patch(crop)
+            total += math.log(max(conf, 1e-3))
+            if apply_prior:
+                ratio = (pb[2] - pb[0]) / max(pb[3] - pb[1], 1)
+                if ratio > 1.1:
+                    total -= (ratio - 1.1) * 2.5
+        return total
+
+    boxes = sorted(char_boxes, key=lambda b: b[0])
+
+    # Group boxes that sit close together: pieces of one joined word.
+    clusters, cur = [], [boxes[0]]
+    for b in boxes[1:]:
+        if b[0] - cur[-1][2] < 0.12 * med_h:
+            cur.append(b)
+        else:
+            clusters.append(cur)
+            cur = [b]
+    clusters.append(cur)
+
+    out = []
+    cluster_unions = []
+    for cluster in clusters:
+        cluster_unions.append((min(b[0] for b in cluster), min(b[1] for b in cluster),
+                               max(b[2] for b in cluster), max(b[3] for b in cluster)))
+    for ci, cluster in enumerate(clusters):
+        ux1, uy1, ux2, uy2 = cluster_unions[ci]
+        if len(cluster) == 1 and not _too_wide((ux1, uy1, ux2, uy2), med_h):
+            out.extend(cluster)
+            continue
+
+        lo_lim, hi_lim = ux1 + int(0.3 * med_h), ux2 - int(0.3 * med_h)
+        valleys = [v for v in _local_minima(prof_s, lo_lim, hi_lim) if lo_lim <= v <= hi_lim]
+        valleys = sorted(sorted(valleys, key=lambda v: prof_s[v])[:12])
+        # A cursive join can sit on a smooth slope with no local minimum,
+        # so candidates are valleys PLUS a dense grid; the classifier picks
+        # the actual joint, on-valley or not.
+        step = max(2, int(0.075 * med_h))
+        grid = list(range(lo_lim, hi_lim + 1, step))[:28]
+        cand_set = sorted(set(valleys) | set(grid))
+        if hi_lim - lo_lim < 4 or not cand_set:
+            out.extend(cluster)
+            continue
+
+        # Evenly spaced letter count: Devanagari letter bodies run ~0.5-0.9x
+        # of their height, so divide by 0.7. The classifier arbitrates
+        # between this count and one less. Keeping the blob whole is only an
+        # option for an ISOLATED too-wide blob (grid-style page, big gaps to
+        # both neighbors) that the classifier reads with near-certainty -
+        # that is a single wide-written glyph. A blob inside a word flow is
+        # a cursive join in disguise (a confident junk label like ख) and
+        # must split.
+        wchar, wconf = None, 0.0
+        wcrop = line_gray[uy1:uy2, ux1:ux2]
+        if wcrop.size:
+            wchar, wconf = recognizer.predict_patch(wcrop)
+        left_gap = ux1 - cluster_unions[ci - 1][2] if ci > 0 else float("inf")
+        right_gap = cluster_unions[ci + 1][0] - ux2 if ci + 1 < len(clusters) else float("inf")
+        whole_allowed = (wchar is not None and wchar not in DIGIT_UNICODE
+                         and wconf >= 0.97
+                         and (ux2 - ux1) <= 1.85 * max(uy2 - uy1, 1)
+                         and left_gap >= 0.45 * med_h and right_gap >= 0.45 * med_h)
+        want = max(2, int(round((ux2 - ux1) / (0.7 * med_h))))
+        min_w = 0.3 * med_h
+        n_options = {min(want, 6)}
+        if whole_allowed:
+            n_options.add(1)
+        best_cuts, best_score = None, None
+        for n_pieces in sorted(n_options):
+            if n_pieces == 1:
+                # Whole blob: no width prior - a wide single glyph genuinely
+                # is wider than tall, that is the whole point of this option.
+                cand, score = [], slice_score([], ux1, ux2, apply_prior=False)
+            else:
+                n_cuts = n_pieces - 1    # too-wide clusters must split
+                ideals = [ux1 + (ux2 - ux1) * (i + 1) / float(n_pieces)
+                          for i in range(n_cuts)]
+                cand, used = [], set()
+                for t in ideals:
+                    v = min((x for x in cand_set if x not in used),
+                            key=lambda x: abs(x - t), default=None)
+                    if v is None:
+                        continue
+                    if cand and v - cand[-1] < min_w:
+                        continue
+                    used.add(v)
+                    cand.append(v)
+                if not cand:
+                    continue
+                score = slice_score(cand, ux1, ux2)
+                for _ in range(2):    # coordinate ascent on cut positions
+                    improved = False
+                    for i in range(len(cand)):
+                        low = cand[i - 1] + min_w if i > 0 else lo_lim
+                        high = cand[i + 1] - min_w if i < len(cand) - 1 else hi_lim
+                        for v in cand_set:
+                            if v in cand or not (low <= v <= high):
+                                continue
+                            if abs(v - cand[i]) > 0.35 * med_h:
+                                continue    # keep the search local per cut
+                            trial = list(cand)
+                            trial[i] = v
+                            s = slice_score(trial, ux1, ux2)
+                            if s > score + 1e-6:
+                                cand, score, improved = trial, s, True
+                    if not improved:
+                        break
+            if best_score is None or score > best_score:
+                best_score, best_cuts = score, cand
+
+        final_boxes = []
+        if best_cuts:
+            edges = [ux1] + best_cuts + [ux2 + 1]
+            for i in range(len(edges) - 1):
+                pb = piece_box(edges[i], edges[i + 1] - 1)
+                if pb is not None:
+                    final_boxes.append(pb)
+        out.extend(final_boxes if final_boxes else cluster)
+
+    out.sort(key=lambda b: b[0])
+
+    if debug_dir:
+        vis = cv2.cvtColor(line_gray, cv2.COLOR_GRAY2BGR)
+        for b in out:
+            cv2.rectangle(vis, (b[0], b[1]), (b[2], b[3]), (0, 160, 255), 2)
+        cv2.imwrite(os.path.join(debug_dir, f"{line_tag}_e_refined.png"), vis)
+
+    return out
 
 
 def _ink_binary(gray):
@@ -574,6 +900,16 @@ def extract_line_crops(gray_image):
         line_boxes.append((int(xs.min()), int(y1), int(xs.max()) + 1, int(y2)))
 
     line_boxes.sort(key=lambda b: b[1])
+
+    # Drop matra-only bands: a floating upper-zone matra part (ी hook, ं
+    # candrabindu) separated from its word by a vertical gap forms its own
+    # short band. It has no class of its own among the 46 DHCD classes, so
+    # classifying it always yields a junk digit/bar - better to drop the
+    # band. Real text lines sit well above 22% of the median line height.
+    if line_boxes:
+        med_line_h = float(np.median([b[3] - b[1] for b in line_boxes]))
+        line_boxes = [b for b in line_boxes if (b[3] - b[1]) >= 0.22 * med_line_h]
+
     return line_boxes
 
 
@@ -853,9 +1189,14 @@ def group_into_lines(detections, line_threshold_ratio=0.6):
     return lines
 
 
-def run_pipeline(image_path, model_path="devanagari_cnn.pth", min_confidence=0.10):
+def run_pipeline(image_path, model_path="devanagari_cnn.pth", min_confidence=0.10, debug=False):
     """
     Full pipeline entry point for image inference.
+
+    With debug=True, intermediate stage images (preprocessed page, ink
+    binary, per-line stripped binary / ink projection / segmentation boxes,
+    refined boxes, and every glyph crop with its prediction) are dumped to
+    debug_output/ for inspection.
     """
     if not os.path.exists(image_path):
         print(f"[ERROR] Input image not found: {image_path}")
@@ -870,13 +1211,20 @@ def run_pipeline(image_path, model_path="devanagari_cnn.pth", min_confidence=0.1
     if orig is None:
         print(f"[ERROR] cv2.imread failed on {image_path}")
         return
-        
+
     print(f"[STEP 1] Image loaded ({orig.shape[1]}x{orig.shape[0]} px)")
 
     # Step 2: Preprocess Image
     enhanced_gray = full_preprocessing_pipeline(orig)
     display_img = cv2.resize(orig, (enhanced_gray.shape[1], enhanced_gray.shape[0]))
     print("[STEP 2] Applied enhancement chain (Shadow removal, Deskew, CLAHE, Line erase)")
+
+    debug_dir = None
+    if debug:
+        debug_dir = "debug_output"
+        os.makedirs(debug_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(debug_dir, "page_1_preprocessed.png"), enhanced_gray)
+        cv2.imwrite(os.path.join(debug_dir, "page_2_ink_binary.png"), _ink_binary(enhanced_gray))
 
     # Step 3: Segment Lines & Characters
     line_boxes = extract_line_crops(enhanced_gray)
@@ -890,22 +1238,39 @@ def run_pipeline(image_path, model_path="devanagari_cnn.pth", min_confidence=0.1
         line_crop = enhanced_gray[ly1:ly2, lx1:lx2]
         if line_crop.size == 0:
             continue
-            
-        char_boxes = segment_characters_from_line(line_crop)
-        
-        for (cx1, cy1, cx2, cy2) in char_boxes:
+
+        line_tag = f"line{line_idx:02d}"
+        char_boxes = segment_characters_from_line(line_crop, debug_dir=debug_dir, line_tag=line_tag)
+        char_boxes = refine_character_cuts(line_crop, char_boxes, recognizer,
+                                           debug_dir=debug_dir, line_tag=line_tag)
+        med_line = float(np.median([b[3] - b[1] for b in char_boxes])) if char_boxes else 0.0
+
+        for glyph_idx, (cx1, cy1, cx2, cy2) in enumerate(char_boxes):
             char_crop = line_crop[cy1:cy2, cx1:cx2]
             if char_crop.size == 0:
                 continue
-                
+
             pred_char, confidence = recognizer.predict_patch(char_crop)
-            
+
+            # Junk gate: a narrow digit-read fragment is a floating matra
+            # tail (the vertical of ा, the hook of ी) that got separated
+            # from its word. Matras have no output class among the 46, so
+            # such a fragment always classifies as a digit; real written
+            # digits are ~0.5+ of a glyph width and survive the filter.
+            if med_line > 0 and pred_char in DIGIT_UNICODE and (cx2 - cx1) < 0.4 * med_line:
+                continue
+
+            if debug_dir:
+                cv2.imwrite(os.path.join(
+                    debug_dir, f"glyph_{line_tag}_{glyph_idx:02d}_{pred_char}_{confidence:.2f}.png"),
+                    char_crop)
+
             # Global bounding box coordinates
             gx1 = lx1 + cx1
             gy1 = ly1 + cy1
             gx2 = lx1 + cx2
             gy2 = ly1 + cy2
-            
+
             if confidence >= min_confidence:
                 bbox_format = [[gx1, gy1], [gx2, gy1], [gx2, gy2], [gx1, gy2]]
                 all_detections.append((bbox_format, pred_char, confidence))
@@ -924,10 +1289,22 @@ def run_pipeline(image_path, model_path="devanagari_cnn.pth", min_confidence=0.1
         print("  EXTRACTED TEXT OUTPUT")
         print("═" * 70)
         for i, line_items in enumerate(text_lines, 1):
-            line_str = "".join([item[1] for item in line_items])
+            # Word spacing: a gap wider than ~0.9 glyph heights separates
+            # words, not characters - emit a single space there.
+            heights = [bbox_to_xyxy(item[0])[3] - bbox_to_xyxy(item[0])[1]
+                       for item in line_items]
+            med_h = float(np.median(heights)) if heights else 0.0
+            parts, prev_x2 = [], None
+            for (bbox, text, conf) in line_items:
+                x1, y1, x2, y2 = bbox_to_xyxy(bbox)
+                if prev_x2 is not None and med_h > 0 and (x1 - prev_x2) > 0.9 * med_h:
+                    parts.append(" ")
+                parts.append(text)
+                prev_x2 = x2
+            line_str = "".join(parts)
             print(f"  Line {i:02d}: {line_str}")
             f.write(line_str + "\n")
-            
+
             for (bbox, text, conf) in line_items:
                 x1, y1, x2, y2 = bbox_to_xyxy(bbox)
                 color = (0, 220, 0) if conf > 0.8 else ((0, 220, 220) if conf > 0.5 else (0, 0, 220))
@@ -949,6 +1326,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="DevanagariHandwrittenCharacterDataset", help="Directory containing the DHCD dataset for training")
     parser.add_argument("--model_path", type=str, default="devanagari_cnn.pth", help="Path to save/load model checkpoint")
     parser.add_argument("--epochs", type=int, default=10, help="Epochs for training mode")
+    parser.add_argument("--debug", action="store_true", help="Dump intermediate segmentation/recognition images to debug_output/")
 
     args = parser.parse_args()
 
@@ -963,4 +1341,4 @@ if __name__ == "__main__":
             print(f"[ERROR] Input image not found: {args.image}")
             sys.exit(1)
 
-        run_pipeline(image_path=args.image, model_path=args.model_path)
+        run_pipeline(image_path=args.image, model_path=args.model_path, debug=args.debug)

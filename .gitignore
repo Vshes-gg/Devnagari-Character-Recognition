@@ -1,5 +1,22 @@
+# Python
 .venv/
 venv/
 __pycache__/
+
+# macOS
 .DS_Store
+
+# ZCode
 .zcode/
+
+# Datasets (public DHCD download, ~1 GB - fetch separately, never commit)
+DevanagariHandwrittenCharacterDataset/
+
+# Node dependencies (report_build tooling)
+node_modules/
+
+# Regenerable OCR debug dumps (--debug flag)
+debug_output/
+
+# LibreOffice lock files
+.~lock.*#

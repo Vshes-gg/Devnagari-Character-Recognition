@@ -81,6 +81,13 @@ dominates page-level accuracy:
   rows stay horizontal.
 - Even light; avoid shadows and paper folds in the text area.
 - Write characters separately (clear gaps) or as words with normal spacing.
+- **Joined-up (cursive) words are handled**: runs wider than a single glyph
+  are split at the recognizer's best joint. Two limits remain: the 46 DHCD
+  classes contain no independent vowels (अ इ ई उ ...) and no standalone
+  matras, so words built on them (मलाई, गती) keep their consonants but
+  misread the vowel signs; and a *very* wide isolated glyph in a spaced
+  grid can still be mistaken for a join. Inspect any page with
+  `--debug` (dumps every intermediate stage to `debug_output/`).
 
 ---
 
@@ -113,8 +120,11 @@ python evaluate_accuracy.py
 python devanagari_ocr.py --mode infer --image my_handwriting.jpeg
 ```
 
-Outputs of `infer`: `extracted_devanagari.txt` (UTF-8 Devanagari text) and
-`ocr_output_visual.png` (annotated photo).
+Outputs of `infer`: `extracted_devanagari.txt` (UTF-8 Devanagari text, with
+word spaces) and `ocr_output_visual.png` (annotated photo). Add `--debug`
+to also dump every intermediate stage (binarization, projections,
+segmentation boxes, each glyph crop with its prediction) to
+`debug_output/`.
 
 Useful flags: `--data_dir` (dataset root), `--model_path`
 (checkpoint to save/load), `--epochs`.
