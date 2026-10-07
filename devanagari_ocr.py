@@ -1325,7 +1325,7 @@ if __name__ == "__main__":
     parser.add_argument("--image", type=str, default="my_handwriting.jpeg", help="Path to input image for OCR inference")
     parser.add_argument("--data_dir", type=str, default="DevanagariHandwrittenCharacterDataset", help="Directory containing the DHCD dataset for training")
     parser.add_argument("--model_path", type=str, default="devanagari_cnn.pth", help="Path to save/load model checkpoint")
-    parser.add_argument("--epochs", type=int, default=10, help="Epochs for training mode")
+    parser.add_argument("--epochs", type=int, default=15, help="Epochs for training mode")
     parser.add_argument("--debug", action="store_true", help="Dump intermediate segmentation/recognition images to debug_output/")
 
     args = parser.parse_args()
